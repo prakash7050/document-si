@@ -947,3 +947,4 @@ if __name__ == "__main__":
     # Local + Render fallback. Render provides PORT automatically.
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+    
