@@ -6,6 +6,8 @@ import uuid
 from typing import Any
 
 from flask import Flask, request, send_file, jsonify, url_for
+from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from docx import Document
 from google import genai
 from dotenv import load_dotenv
@@ -13,6 +15,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+# Render (and most PaaS providers) terminate HTTPS at a proxy and forward
+# plain HTTP to the container. Without this, url_for(..., _external=True)
+# can generate http:// links instead of https://. ProxyFix reads the
+# X-Forwarded-Proto / X-Forwarded-Host headers Render sets and fixes that.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+# Allow the frontend (a different origin than this API) to call /fill-docx,
+# /analyze, and to fetch the generated file from /files/<name> with a plain
+# fetch()/XHR request. Set ALLOWED_ORIGINS in your Render environment
+# variables to a comma-separated list of your actual frontend URL(s) to
+# lock this down; it defaults to "*" (any origin) so it works out of the box.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+CORS(
+    app,
+    resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=False,
+)
 
 MAX_FILE_MB = 15
 ALLOWED_EXTENSIONS = {".docx"}
@@ -645,7 +669,7 @@ def health():
         "ai_provider": "gemini",
         "model": GEMINI_MODEL,
         "gemini_key_configured": bool(os.getenv("GEMINI_API_KEY")),
-        "version": "2.1-download-url",
+        "version": "2.2-cors-proxyfix",
     })
 
 
