@@ -2,10 +2,10 @@ import os
 import io
 import json
 import re
+import uuid
 from typing import Any
 
-from flask import Flask, request, send_file, jsonify
-from flask_cors import CORS
+from flask import Flask, request, send_file, jsonify, url_for
 from docx import Document
 from google import genai
 from dotenv import load_dotenv
@@ -14,21 +14,13 @@ load_dotenv()
 
 app = Flask(__name__)
 
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    expose_headers=[
-        "X-Filled-Fields",
-        "X-Unmatched-Fields",
-        "X-Mapping-Mode",
-        "Content-Disposition",
-    ],
-)
-
 MAX_FILE_MB = 15
 ALLOWED_EXTENSIONS = {".docx"}
+
+# Where generated (filled) documents are stored so they can be served back
+# as a downloadable URL instead of only as a raw binary response body.
+GENERATED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_files")
+os.makedirs(GENERATED_DIR, exist_ok=True)
 
 # Gemini is only used to understand the template and map JSON keys to
 # locations in the document. DOCX editing is done locally with python-docx.
@@ -634,6 +626,17 @@ def validate_upload(file_storage):
         raise ValueError(f"File too large. Maximum is {MAX_FILE_MB} MB.")
 
 
+def save_generated_file(doc: Document) -> tuple[str, str]:
+    """
+    Save the filled document to GENERATED_DIR under a random, unguessable
+    filename and return (stored_filename, public_facing_download_name).
+    """
+    stored_filename = f"{uuid.uuid4().hex}.docx"
+    stored_path = os.path.join(GENERATED_DIR, stored_filename)
+    doc.save(stored_path)
+    return stored_filename, "filled_document.docx"
+
+
 @app.get("/health")
 def health():
     return jsonify({
@@ -642,7 +645,7 @@ def health():
         "ai_provider": "gemini",
         "model": GEMINI_MODEL,
         "gemini_key_configured": bool(os.getenv("GEMINI_API_KEY")),
-        "version": "2.0-deterministic-repeat-tables",
+        "version": "2.1-download-url",
     })
 
 
@@ -652,7 +655,12 @@ def home():
         "message": "DOCX Auto Fill API is running",
         "endpoints": {
             "POST /analyze": "multipart/form-data: file=<template.docx>",
-            "POST /fill-docx": "multipart/form-data: file=<template.docx>, data=<JSON string>",
+            "POST /fill-docx": (
+                "multipart/form-data: file=<template.docx>, data=<JSON string>. "
+                "Returns JSON with a download_url. Add ?download=1 to instead "
+                "get the .docx file directly in the response body."
+            ),
+            "GET /files/<filename>": "Download a previously generated .docx file.",
         },
     })
 
@@ -681,6 +689,27 @@ def analyze():
 
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.get("/files/<path:filename>")
+def get_generated_file(filename):
+    # filename is a random uuid4 hex we generated ourselves, but guard
+    # against path traversal regardless.
+    safe_name = os.path.basename(filename)
+    file_path = os.path.join(GENERATED_DIR, safe_name)
+
+    if not os.path.isfile(file_path):
+        return jsonify({"success": False, "error": "File not found"}), 404
+
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name="filled_document.docx",
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+    )
 
 
 @app.post("/fill-docx")
@@ -788,26 +817,6 @@ def fill_docx():
             }
         )
 
-        output = io.BytesIO()
-        doc.save(output)
-        output.seek(0)
-
-        response = send_file(
-            output,
-            as_attachment=True,
-            download_name="filled_document.docx",
-            mimetype=(
-                "application/vnd.openxmlformats-officedocument."
-                "wordprocessingml.document"
-            ),
-        )
-
-        response.headers["X-Filled-Fields"] = json.dumps(
-            sorted(set(filled)), ensure_ascii=True
-        )
-        response.headers["X-Unmatched-Fields"] = json.dumps(
-            sorted(set(missing)), ensure_ascii=True
-        )
         if placeholders:
             mapping_mode = "placeholder"
         elif mapping_used and deterministic_filled:
@@ -817,8 +826,47 @@ def fill_docx():
         else:
             mapping_mode = "gemini"
 
-        response.headers["X-Mapping-Mode"] = mapping_mode
-        return response
+        # Backwards-compatible mode: return the raw .docx bytes directly,
+        # exactly like the previous version of this API.
+        if request.args.get("download") == "1":
+            output = io.BytesIO()
+            doc.save(output)
+            output.seek(0)
+
+            response = send_file(
+                output,
+                as_attachment=True,
+                download_name="filled_document.docx",
+                mimetype=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+            )
+            response.headers["X-Filled-Fields"] = json.dumps(
+                sorted(set(filled)), ensure_ascii=True
+            )
+            response.headers["X-Unmatched-Fields"] = json.dumps(
+                sorted(set(missing)), ensure_ascii=True
+            )
+            response.headers["X-Mapping-Mode"] = mapping_mode
+            return response
+
+        # Default mode: save the file to disk and return a JSON response
+        # with a downloadable URL, so clients (Postman, browsers, mobile
+        # apps) can just open/share a link instead of handling raw bytes.
+        stored_filename, download_name = save_generated_file(doc)
+        download_url = url_for(
+            "get_generated_file", filename=stored_filename, _external=True
+        )
+
+        return jsonify({
+            "success": True,
+            "download_url": download_url,
+            "filename": download_name,
+            "filled": sorted(set(filled)),
+            "missing": sorted(set(missing)),
+            "mapping_mode": mapping_mode,
+        })
 
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 500
