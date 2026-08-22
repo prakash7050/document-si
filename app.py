@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from flask import Flask, request, send_file, jsonify
+from flask_cors import CORS
 from docx import Document
 from google import genai
 from dotenv import load_dotenv
@@ -12,6 +13,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=[
+        "X-Filled-Fields",
+        "X-Unmatched-Fields",
+        "X-Mapping-Mode",
+        "Content-Disposition",
+    ],
+)
 
 MAX_FILE_MB = 15
 ALLOWED_EXTENSIONS = {".docx"}
