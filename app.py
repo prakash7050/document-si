@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import time
 import uuid
 from typing import Any
 
@@ -10,6 +11,7 @@ from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from docx import Document
 from google import genai
+from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -49,6 +51,27 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 # Gemini is only used to understand the template and map JSON keys to
 # locations in the document. DOCX editing is done locally with python-docx.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+# Optional fallback model to try if GEMINI_MODEL is overloaded (503) on every
+# retry attempt. Leave GEMINI_FALLBACK_MODEL unset to disable the fallback.
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "")
+
+# Retry tuning for transient Gemini errors (503 UNAVAILABLE / 429 RESOURCE_EXHAUSTED).
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "4"))
+GEMINI_RETRY_BASE_DELAY_SECONDS = float(os.getenv("GEMINI_RETRY_BASE_DELAY_SECONDS", "2"))
+
+RETRYABLE_GEMINI_STATUS_CODES = {429, 500, 503}
+
+
+def _is_retryable_gemini_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int) and code in RETRYABLE_GEMINI_STATUS_CODES:
+        return True
+    message = str(exc).upper()
+    return any(
+        marker in message
+        for marker in ("UNAVAILABLE", "RESOURCE_EXHAUSTED", "OVERLOADED", "503", "429")
+    )
 
 
 def get_gemini_client() -> genai.Client:
@@ -554,19 +577,43 @@ DATA:
 {json.dumps(data, ensure_ascii=False, indent=2)}
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": schema,
-        },
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models_to_try.append(GEMINI_FALLBACK_MODEL)
+
+    last_error: Exception | None = None
+
+    for model_name in models_to_try:
+        for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_schema": schema,
+                    },
+                )
+
+                if not response.text:
+                    raise RuntimeError("Gemini returned an empty response.")
+
+                return json.loads(response.text)
+
+            except (genai_errors.APIError, RuntimeError, Exception) as exc:  # noqa: BLE001
+                last_error = exc
+
+                if not _is_retryable_gemini_error(exc) or attempt == GEMINI_MAX_RETRIES:
+                    break
+
+                # Exponential backoff: 2s, 4s, 8s, ... before the next attempt.
+                delay = GEMINI_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                time.sleep(delay)
+
+    raise RuntimeError(
+        f"Gemini is currently unavailable after {GEMINI_MAX_RETRIES} attempt(s) "
+        f"per model ({', '.join(models_to_try)}). Last error: {last_error}"
     )
-
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-
-    return json.loads(response.text)
 
 
 def apply_assignments(doc: Document, assignments: list[dict], data: dict):

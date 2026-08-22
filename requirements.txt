@@ -1,6 +1,5 @@
-flask-cors>=6.0,<7.0
-openai>=1.100,<2.0
 Flask>=3.0,<4.0
+flask-cors>=4.0,<5.0
 python-docx>=1.1,<2.0
 google-genai>=1.0,<2.0
 python-dotenv>=1.0,<2.0
